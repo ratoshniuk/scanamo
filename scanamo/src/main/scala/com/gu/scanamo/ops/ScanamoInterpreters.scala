@@ -1,16 +1,15 @@
 package org.scanamo.ops
 
+import java.util.concurrent.{CompletableFuture, ExecutionException}
+
 import cats._
 import cats.data.NonEmptyList
 import cats.syntax.either._
-import com.amazonaws.AmazonWebServiceRequest
-import com.amazonaws.handlers.AsyncHandler
-import com.amazonaws.services.dynamodbv2.{AmazonDynamoDB, AmazonDynamoDBAsync}
-import com.amazonaws.services.dynamodbv2.model.{UpdateItemResult, _}
 import org.scanamo.request._
-
-import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import software.amazon.awssdk.services.dynamodb.model._
+import software.amazon.awssdk.services.dynamodb.{DynamoDbAsyncClient, DynamoDbClient}
+import scala.concurrent.Future
+import scala.util.Try
 
 /**
   * Interpreters to take the operations defined with Scanamo and execute them
@@ -27,7 +26,7 @@ object ScanamoInterpreters {
     * the [Id Monad](http://typelevel.org/cats/datatypes/id.html) which is just
     * a type alias for the type itself (`type Id[A] = A`).
     */
-  def id(client: AmazonDynamoDB) = new (ScanamoOpsA ~> Id) {
+  def id(client: DynamoDbClient) = new (ScanamoOpsA ~> Id) {
     def apply[A](op: ScanamoOpsA[A]): Id[A] = op match {
       case Put(req) =>
         client.putItem(JavaRequests.put(req))
@@ -64,165 +63,170 @@ object ScanamoInterpreters {
     * Interpret Scanamo operations into a `Future` using the AmazonDynamoDBAsync client
     * which doesn't block, using it's own thread pool for I/O requests internally
     */
-  def future(client: AmazonDynamoDBAsync)(implicit ec: ExecutionContext) = new (ScanamoOpsA ~> Future) {
-    private def futureOf[X <: AmazonWebServiceRequest, T](
-      call: (X, AsyncHandler[X, T]) => java.util.concurrent.Future[T],
-      req: X
+  def future(client: DynamoDbAsyncClient) = new (ScanamoOpsA ~> Future) {
+
+    private def futureOf[T]
+    (
+      req: CompletableFuture[T],
     ): Future[T] = {
-      val p = Promise[T]()
-      val h = new AsyncHandler[X, T] {
-        def onError(exception: Exception) { p.complete(Failure(exception)); () }
-        def onSuccess(request: X, result: T) { p.complete(Success(result)); () }
+      Future.fromTry(Try(req.get()))
+    }
+
+    private def futureAsEither[T, E <: DynamoDbException](req: CompletableFuture[T])(f : Throwable => Option[E]) : Future[Either[E, T]] = {
+      Future.fromTry {
+        Try(req.get()).map(Either.right[E, T]).recover {
+          case ec : ExecutionException if f(ec.getCause).isDefined =>
+            val a = f(ec.getCause).get
+            Either.left(a)
+        }
       }
-      call(req, h)
-      p.future
     }
 
     override def apply[A](op: ScanamoOpsA[A]): Future[A] = op match {
       case Put(req) =>
-        futureOf(client.putItemAsync, JavaRequests.put(req))
+        futureOf(client.putItem(JavaRequests.put(req)))
       case ConditionalPut(req) =>
-        futureOf(client.putItemAsync, JavaRequests.put(req))
-          .map(Either.right[ConditionalCheckFailedException, PutItemResult])
-          .recover {
-            case e: ConditionalCheckFailedException => Either.left(e)
-          }
+        futureAsEither[PutItemResponse, ConditionalCheckFailedException](client.putItem(JavaRequests.put(req))) {
+          case e: ConditionalCheckFailedException => Some(e)
+          case _ => None
+        }
       case Get(req) =>
-        futureOf(client.getItemAsync, req)
+        futureOf(client.getItem(req))
       case Delete(req) =>
-        futureOf(client.deleteItemAsync, JavaRequests.delete(req))
+        futureOf(client.deleteItem(JavaRequests.delete(req)))
       case ConditionalDelete(req) =>
-        futureOf(client.deleteItemAsync, JavaRequests.delete(req))
-          .map(Either.right[ConditionalCheckFailedException, DeleteItemResult])
-          .recover { case e: ConditionalCheckFailedException => Either.left(e) }
+        futureAsEither[DeleteItemResponse, ConditionalCheckFailedException](client.deleteItem(JavaRequests.delete(req))) {
+          case e: ConditionalCheckFailedException => Some(e)
+          case _ => None
+        }
       case Scan(req) =>
-        futureOf(client.scanAsync, JavaRequests.scan(req))
+        futureOf(client.scan(JavaRequests.scan(req)))
       case Query(req) =>
-        futureOf(client.queryAsync, JavaRequests.query(req))
+        futureOf(client.query(JavaRequests.query(req)))
       // Overloading means we need explicit parameter types here
       case BatchWrite(req) =>
-        futureOf(
-          client.batchWriteItemAsync(
-            _: BatchWriteItemRequest,
-            _: AsyncHandler[BatchWriteItemRequest, BatchWriteItemResult]
-          ),
-          req
-        )
+        futureOf(client.batchWriteItem(req))
       case BatchGet(req) =>
-        futureOf(
-          client.batchGetItemAsync(_: BatchGetItemRequest, _: AsyncHandler[BatchGetItemRequest, BatchGetItemResult]),
-          req
-        )
+        futureOf(client.batchGetItem(req))
       case Update(req) =>
-        futureOf(client.updateItemAsync, JavaRequests.update(req))
+        futureOf(client.updateItem(JavaRequests.update(req)))
       case ConditionalUpdate(req) =>
-        futureOf(client.updateItemAsync, JavaRequests.update(req))
-          .map(Either.right[ConditionalCheckFailedException, UpdateItemResult])
-          .recover {
-            case e: ConditionalCheckFailedException => Either.left(e)
-          }
+        futureAsEither[UpdateItemResponse, ConditionalCheckFailedException](client.updateItem(JavaRequests.update(req))){
+          case e: ConditionalCheckFailedException => Some(e)
+          case _ => None
+        }
     }
   }
 }
 
 private[ops] object JavaRequests {
+
   import collection.JavaConverters._
 
   def scan(req: ScanamoScanRequest): ScanRequest = {
     def queryRefinement[T](
-      o: ScanamoScanRequest => Option[T]
-    )(rt: (ScanRequest, T) => ScanRequest): ScanRequest => ScanRequest = { qr =>
+                            o: ScanamoScanRequest => Option[T]
+                          )(rt: (ScanRequest.Builder, T) => ScanRequest.Builder): ScanRequest.Builder => ScanRequest.Builder = { qr =>
       o(req).foldLeft(qr)(rt)
     }
 
     NonEmptyList
       .of(
-        queryRefinement(_.index)(_.withIndexName(_)),
-        queryRefinement(_.options.limit)(_.withLimit(_)),
-        queryRefinement(_.options.exclusiveStartKey)((r, k) => r.withExclusiveStartKey(k)),
+        queryRefinement(_.index)(_.indexName(_)),
+        queryRefinement(_.options.limit)(_.limit(_)),
+        queryRefinement(_.options.exclusiveStartKey)((r, k) => r.exclusiveStartKey(k)),
         queryRefinement(_.options.filter)((r, f) => {
           val requestCondition = f.apply(None)
           val filteredRequest = r
-            .withFilterExpression(requestCondition.expression)
-            .withExpressionAttributeNames(requestCondition.attributeNames.asJava)
+            .filterExpression(requestCondition.expression)
+            .expressionAttributeNames(requestCondition.attributeNames.asJava)
           requestCondition.attributeValues
-            .fold(filteredRequest)(avs => filteredRequest.withExpressionAttributeValues(avs.asJava))
+            .fold(filteredRequest)(avs => filteredRequest.expressionAttributeValues(avs.asJava))
         })
       )
       .reduceLeft(_.compose(_))(
-        new ScanRequest().withTableName(req.tableName).withConsistentRead(req.options.consistent)
+        ScanRequest.builder().tableName(req.tableName).consistentRead(req.options.consistent)
       )
+      .build()
   }
 
   def query(req: ScanamoQueryRequest): QueryRequest = {
     def queryRefinement[T](
-      o: ScanamoQueryRequest => Option[T]
-    )(rt: (QueryRequest, T) => QueryRequest): QueryRequest => QueryRequest = { qr =>
+                            o: ScanamoQueryRequest => Option[T]
+                          )(rt: (QueryRequest.Builder, T) => QueryRequest.Builder): QueryRequest.Builder => QueryRequest.Builder = { qr =>
       o(req).foldLeft(qr)(rt)
     }
 
     NonEmptyList
       .of(
-        queryRefinement(_.index)(_.withIndexName(_)),
-        queryRefinement(_.options.limit)(_.withLimit(_)),
-        queryRefinement(_.options.exclusiveStartKey)((r, k) => r.withExclusiveStartKey(k)),
+        queryRefinement(_.index)(_.indexName(_)),
+        queryRefinement(_.options.limit)(_.limit(_)),
+        queryRefinement(_.options.exclusiveStartKey)((r, k) => r.exclusiveStartKey(k)),
         queryRefinement(_.options.filter)((r, f) => {
           val requestCondition = f.apply(None)
-          r.withFilterExpression(requestCondition.expression)
-            .withExpressionAttributeNames(
-              (r.getExpressionAttributeNames.asScala ++ requestCondition.attributeNames).asJava
+
+          val curReq = r.build()
+
+          r.filterExpression(requestCondition.expression)
+            .expressionAttributeNames(
+              (curReq.expressionAttributeNames.asScala ++ requestCondition.attributeNames).asJava
             )
-            .withExpressionAttributeValues(
-              (r.getExpressionAttributeValues.asScala ++ requestCondition.attributeValues.getOrElse(Map.empty)).asJava
+            .expressionAttributeValues(
+              (curReq.expressionAttributeValues.asScala ++ requestCondition.attributeValues.getOrElse(Map.empty)).asJava
             )
         })
       )
       .reduceLeft(_.compose(_))(
-        req.query(new QueryRequest().withTableName(req.tableName).withConsistentRead(req.options.consistent))
-      )
+        req.query(QueryRequest.builder().tableName(req.tableName).consistentRead(req.options.consistent))
+      ).build()
   }
 
   def put(req: ScanamoPutRequest): PutItemRequest =
     req.condition.foldLeft(
-      new PutItemRequest()
-        .withTableName(req.tableName)
-        .withItem(req.item.getM)
-        .withReturnValues(ReturnValue.ALL_OLD)
+      PutItemRequest.builder().tableName(req.tableName)
+        .item(req.item.m())
+        .returnValues(ReturnValue.ALL_OLD)
     )(
       (r, c) =>
         c.attributeValues.foldLeft(
-          r.withConditionExpression(c.expression).withExpressionAttributeNames(c.attributeNames.asJava)
-        )((cond, values) => cond.withExpressionAttributeValues(values.asJava))
-    )
+          r.conditionExpression(c.expression).expressionAttributeNames(c.attributeNames.asJava)
+        )((cond, values) => cond.expressionAttributeValues(values.asJava))
+    ).build()
 
-  def delete(req: ScanamoDeleteRequest): DeleteItemRequest =
+  def delete(req: ScanamoDeleteRequest): DeleteItemRequest = {
     req.condition.foldLeft(
-      new DeleteItemRequest().withTableName(req.tableName).withKey(req.key.asJava)
+      DeleteItemRequest.builder().tableName(req.tableName)
+        .key(req.key.asJava)
+        .returnValues(ReturnValue.ALL_OLD)
     )(
       (r, c) =>
         c.attributeValues.foldLeft(
-          r.withConditionExpression(c.expression).withExpressionAttributeNames(c.attributeNames.asJava)
-        )((cond, values) => cond.withExpressionAttributeValues(values.asJava))
-    )
+          r.conditionExpression(c.expression).expressionAttributeNames(c.attributeNames.asJava)
+        )((cond, values) => cond.expressionAttributeValues(values.asJava))
+    ).build()
+  }
 
   def update(req: ScanamoUpdateRequest): UpdateItemRequest = {
     val reqWithoutValues = req.condition.foldLeft(
-      new UpdateItemRequest()
-        .withTableName(req.tableName)
-        .withKey(req.key.asJava)
-        .withUpdateExpression(req.updateExpression)
-        .withExpressionAttributeNames(req.attributeNames.asJava)
-        .withReturnValues(ReturnValue.ALL_NEW)
+      UpdateItemRequest.builder()
+        .tableName(req.tableName)
+        .key(req.key.asJava)
+        .updateExpression(req.updateExpression)
+        .expressionAttributeNames(req.attributeNames.asJava)
+        .returnValues(ReturnValue.ALL_NEW)
     )(
       (r, c) =>
         c.attributeValues.foldLeft(
-          r.withConditionExpression(c.expression)
-            .withExpressionAttributeNames((c.attributeNames ++ req.attributeNames).asJava)
-        )((cond, values) => cond.withExpressionAttributeValues((values ++ req.attributeValues).asJava))
+          r.conditionExpression(c.expression)
+            .expressionAttributeNames((c.attributeNames ++ req.attributeNames).asJava)
+        )((cond, values) => cond.expressionAttributeValues((values ++ req.attributeValues).asJava))
     )
 
     val attributeValues = req.condition.flatMap(_.attributeValues).foldLeft(req.attributeValues)(_ ++ _)
-    if (attributeValues.isEmpty) reqWithoutValues
-    else reqWithoutValues.withExpressionAttributeValues(attributeValues.asJava)
+    val out = {
+      if (attributeValues.isEmpty) reqWithoutValues
+      else reqWithoutValues.expressionAttributeValues(attributeValues.asJava)
+    }
+    out.build()
   }
 }

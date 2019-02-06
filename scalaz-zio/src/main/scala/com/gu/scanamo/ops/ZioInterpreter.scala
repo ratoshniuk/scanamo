@@ -1,83 +1,96 @@
 package org.scanamo.ops
 
+import java.util.concurrent.CompletionException
+
 import cats.~>
-import com.amazonaws.AmazonWebServiceRequest
-import com.amazonaws.handlers.AsyncHandler
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBAsync
-import com.amazonaws.services.dynamodbv2.model._
 import scalaz.zio.{ExitResult, IO}
+import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
+import software.amazon.awssdk.services.dynamodb.model._
+
+import scala.compat.java8.FutureConverters
+import scala.concurrent.{ExecutionContext, Future}
+
+import scala.util.{Failure, Success}
 
 object ZioInterpreter {
-  def effect(client: AmazonDynamoDBAsync): ScanamoOpsA ~> IO[AmazonDynamoDBException, ?] =
-    new (ScanamoOpsA ~> IO[AmazonDynamoDBException, ?]) {
-      private def eff[A <: AmazonWebServiceRequest, B](
-        f: (A, AsyncHandler[A, B]) => java.util.concurrent.Future[B],
-        req: A
-      ): IO[AmazonDynamoDBException, B] =
-        IO.async[AmazonDynamoDBException, B] { cb =>
-          val handler = new AsyncHandler[A, B] {
-            def onError(exception: Exception): Unit =
-              exception match {
-                case e: AmazonDynamoDBException => cb(ExitResult.Failed(e))
-                case t                          => cb(ExitResult.Terminated(t :: Nil))
-              }
+  def effect(client: DynamoDbAsyncClient)(implicit ec: ExecutionContext): ScanamoOpsA ~> IO[DynamoDbException, ?] =
+    new (ScanamoOpsA ~> IO[DynamoDbException, ?]) {
+      private def eff[A <: DynamoDbRequest, B](
+        f: java.util.concurrent.CompletionStage[B],
+      ): IO[DynamoDbException, B] =
+        IO.fromFuture(ec)(() => FutureConverters.toScala(f)).redeem( {
+          case e: DynamoDbException => IO.fail(e)
+          case t: Throwable => IO.terminate(t)
+        }, IO.now)
 
-            def onSuccess(request: A, result: B): Unit =
-              cb(ExitResult.Completed(result))
-          }
-          val _ = f(req, handler)
-        }
-
-      def apply[A](op: ScanamoOpsA[A]): IO[AmazonDynamoDBException, A] = op match {
+      def apply[A](op: ScanamoOpsA[A]): IO[DynamoDbException, A] = op match {
         case Put(req) =>
-          eff(client.putItemAsync, JavaRequests.put(req))
+          eff(client.putItem(JavaRequests.put(req)))
         case ConditionalPut(req) =>
-          eff(client.putItemAsync, JavaRequests.put(req)).redeem(
-            _ match {
-              case e: ConditionalCheckFailedException => IO.now(Left(e))
+          eff(client.putItem(JavaRequests.put(req))).redeem(
+            {
+              case e : ConditionalCheckFailedException => IO.now(Left(e))
               case t                                  => IO.fail(t)
             },
-            a => IO.now(Right(a))
+            resp => IO.now(Right(resp))
           )
         case Get(req) =>
-          eff(client.getItemAsync, req)
+          eff(client.getItem(req))
         case Delete(req) =>
-          eff(client.deleteItemAsync, JavaRequests.delete(req))
+          eff(client.deleteItem(JavaRequests.delete(req)))
         case ConditionalDelete(req) =>
-          eff(client.deleteItemAsync, JavaRequests.delete(req)).redeem(
-            _ match {
-              case e: ConditionalCheckFailedException => IO.now(Left(e))
+          eff(client.deleteItem(JavaRequests.delete(req))).redeem(
+            {
+              case e : ConditionalCheckFailedException => IO.now(Left(e))
               case t                                  => IO.fail(t)
             },
-            a => IO.now(Right(a))
+            resp => IO.now(Right(resp))
           )
         case Scan(req) =>
-          eff(client.scanAsync, JavaRequests.scan(req))
+          eff(client.scan(JavaRequests.scan(req)))
         case Query(req) =>
-          eff(client.queryAsync, JavaRequests.query(req))
+          eff(client.query(JavaRequests.query(req)))
         case BatchWrite(req) =>
-          eff(
-            client.batchWriteItemAsync(
-              _: BatchWriteItemRequest,
-              _: AsyncHandler[BatchWriteItemRequest, BatchWriteItemResult]
-            ),
-            req
-          )
+          eff(client.batchWriteItem(req))
         case BatchGet(req) =>
-          eff(
-            client.batchGetItemAsync(_: BatchGetItemRequest, _: AsyncHandler[BatchGetItemRequest, BatchGetItemResult]),
-            req
-          )
+          eff(client.batchGetItem(req))
         case Update(req) =>
-          eff(client.updateItemAsync, JavaRequests.update(req))
+          eff(client.updateItem(JavaRequests.update(req)))
         case ConditionalUpdate(req) =>
-          eff(client.updateItemAsync, JavaRequests.update(req)).redeem(
-            _ match {
-              case e: ConditionalCheckFailedException => IO.now(Left(e))
+          eff(client.updateItem(JavaRequests.update(req))).redeem(
+            {
+              case e : ConditionalCheckFailedException => IO.now(Left(e))
               case t                                  => IO.fail(t)
             },
-            a => IO.now(Right(a))
+            resp => IO.now(Right(resp))
           )
       }
     }
+
+
+  implicit class IOObjOps(private val ioObj: IO.type) extends AnyVal {
+    private def unsafeFromFuture[A](ec: ExecutionContext, f: Future[A]): IO[Throwable, A] =
+      f.value.fold{
+        IO.async[Throwable, A] {
+          cb  => {
+            f.onComplete {
+              case Success(value) =>
+                cb(ExitResult.succeeded(value))
+              case Failure(value: CompletionException) =>
+                cb(ExitResult.failed(ExitResult.Cause.checked(value.getCause)))
+              case Failure(value) =>
+                cb(ExitResult.failed(ExitResult.Cause.checked(value)))
+            }(ec)
+          }
+        }
+      }(IO.fromTry(_))
+
+    def fromFuture[A](ec: ExecutionContext)(ftr: () => Future[A]): IO[Throwable, A] =
+      IO.suspend {
+        unsafeFromFuture(ec, ftr())
+      }
+
+    def fromFutureIO[A, E >: Throwable](ec: ExecutionContext)(ftrio: IO[E, Future[A]]): IO[E, A] =
+      ftrio.flatMap(unsafeFromFuture(ec, _))
+  }
 }

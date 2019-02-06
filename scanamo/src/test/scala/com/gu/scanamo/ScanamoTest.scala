@@ -1,17 +1,15 @@
 package org.scanamo
 
 import cats.implicits._
-import com.amazonaws.services.dynamodbv2.model.ScalarAttributeType._
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBAsync
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.time.{Millis, Seconds, Span}
 import org.scalatest.{FunSpec, Matchers}
-import com.amazonaws.services.dynamodbv2.model.ScalarAttributeType._
 import org.scanamo.error.DynamoReadError
 import org.scanamo.ops.ScanamoOps
 import org.scanamo.query._
 import org.scanamo.syntax._
 import org.scanamo.auto._
+import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType._
 
 class ScanamoTest extends org.scalatest.FunSpec with org.scalatest.Matchers {
 
@@ -92,8 +90,13 @@ class ScanamoTest extends org.scalatest.FunSpec with org.scalatest.Matchers {
         for {
           _ <- farmers.put(Farmer("McGregor", 62L, Farm(List("rabbit"))))
           _ <- farmers.delete('name -> "McGregor")
-          f <- farmers.get('name -> "McGregor")
-        } yield f
+//          f <- farmers.get('name -> "McGregor") // It retrieves an item with empty attributes map. see https://github.com/aws/aws-sdk-java-v2/issues/1051
+          f <- farmers.scan().map(_.collectFirst {
+            case Right(farmer) if farmer.name == "McGregor" => farmer
+          })
+        } yield {
+          f
+        }
       } should equal(None)
     }
   }
